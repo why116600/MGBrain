@@ -22,7 +22,7 @@ private:
     MemSchedule();
 public:
     ~MemSchedule();
-static MemSchedule* AllocateMemory(SLNum length);//构造一个内存调度区
+static MemSchedule* AllocateMemory(SLNum length,SLNum initGrid=0);//构造一个内存调度区
 
     void UpdateToHost();//将当前显存中的块内容更新至主存中
     void UpdateToGPU();//将主存中的当前块内容更新至显存中
@@ -64,7 +64,7 @@ MemSchedule<T>::~MemSchedule()
 #define SPLIT_COUNT 5
 
 template<class T>
-MemSchedule<T> *MemSchedule<T>::AllocateMemory(SLNum length)
+MemSchedule<T> *MemSchedule<T>::AllocateMemory(SLNum length,SLNum initGrid)
 {
     MemSchedule<T> *pRet;
     cudaError_t err;
@@ -72,6 +72,9 @@ MemSchedule<T> *MemSchedule<T>::AllocateMemory(SLNum length)
     T *buf=NULL;
     SLNum nGridLen=length;
     SLNum nSize,nLen;
+
+    if(initGrid>0 && initGrid<length)
+        nGridLen=initGrid;
 
     while(nGridLen>0)//不断缩小空间大小，以试探当前可以申请的内存空间大小
     {

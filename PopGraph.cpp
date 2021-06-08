@@ -586,6 +586,14 @@ void PopGraph::PrintPartition(bool bPrintBest)
         printf("carve edge count:%.1f\n",mCarveCount);
 }
 
+
+SNum PopGraph::GetPopCountInPart(SNum pop,SNum part)
+{
+    if(!mPopIDToArray[part].count(pop))
+        return 0;
+    return mPopIDToArray[part][pop].second;
+}
+
 void PopGraph::UpdatePopNode()
 {
     if(!mPopIDToArray || !mBestPop)
@@ -595,6 +603,10 @@ void PopGraph::UpdatePopNode()
     PopNode *pNode=mBestPop;
     PopNode *pSrc=pNode;
     SNum part,ncount;
+    SNum dstOffsets[mPartCount]={0};
+    SNum srcOffset;
+    SNum dstPop1,dstPop2,srcPop1,srcPop2;
+    SNum buildCount;
     std::pair<SNum,SNum> pair;
     //将各个分部的子族群按分部存放
     do
@@ -627,6 +639,57 @@ void PopGraph::UpdatePopNode()
             mPopIDToArray[part][pNode->GetPopID()]=pair;
             NodeCount+=pNode->GetCount();
         }
+    }
+    //计算一对一连接的外部突触分配
+    for(SNum i=0;i<mConns.size();i++)
+    {
+        if(!mConns[i].bOneToOne)
+            continue;
+        std::map<std::pair<SNum,SNum>,SYN_BUILD> results;
+        std::pair<SNum,SNum> p2p;//分部到分部
+        SYN_BUILD sb;
+        results.clear();
+        for(SNum j=0;j<mPartCount;j++)//先计算目标族群在每个分部中可以内部消化的部分，作为构建外部连接的起始
+        {
+            dstOffsets[j]=0;
+            if(!mPopIDToArray[j].count(mConns[i].pop1) || !mPopIDToArray[j].count(mConns[i].pop2))
+                continue;
+            if(mPopIDToArray[j][mConns[i].pop1].second<mPopIDToArray[j][mConns[i].pop2].second)
+                dstOffsets[j]=mPopIDToArray[j][mConns[i].pop1].second;
+        }
+        for(p2p.first=0;p2p.first<mPartCount;p2p.first++)
+        {
+            srcPop1=GetPopCountInPart(mConns[i].pop1,p2p.first);
+            if(srcPop1<=0)
+                continue;
+            srcPop2=GetPopCountInPart(mConns[i].pop2,p2p.first);
+            if(srcPop1<=srcPop2)//足够内部消化，不需要构建外部连接
+                continue;
+            srcOffset=srcPop2;
+            for(p2p.second=0;p2p.second<mPartCount;p2p.second++)
+            {
+                if(p2p.first==p2p.second)
+                    continue;
+                dstPop2=GetPopCountInPart(mConns[i].pop2,p2p.second);
+                if(dstPop2<=0)
+                    continue;
+                if(dstOffsets[p2p.second]>=dstPop2)//已经消化完毕，不需要构建外部连接
+                    continue;
+                buildCount=srcPop1-srcOffset;
+                if(buildCount>(dstPop2-dstOffsets[p2p.second]))
+                    buildCount=dstPop2-dstOffsets[p2p.second];
+                if(buildCount<=0)
+                    continue;
+                sb.bOneToOne=true;
+                sb.postCount=sb.preCount=buildCount;
+                sb.preOffset=mPopIDToArray[p2p.first][mConns[i].pop1].first+srcOffset;
+                sb.postOffset=mPopIDToArray[p2p.second][mConns[i].pop2].first+dstOffsets[p2p.second];
+                srcOffset+=buildCount;
+                dstOffsets[p2p.second]+=buildCount;
+                results[p2p]=sb;
+            }
+        }
+        m121ConnBuilds[i]=results;
     }
     
     mUpdated=false;
@@ -718,8 +781,7 @@ SNum PopGraph::GetOutterConn(SNum nSrcPart,SNum nDstPart,SYN_BUILD *builds,SNum 
 {
     SNum ncount=0;
     SNum pop1,pop2;
-    SNum nSrcPop1,nDstPop1,nSrcPop2,nDstPop2;
-    SNum srcDelta,dstDelta;
+    std::pair<SNum,SNum> p2p;
     if(mUpdated)
         UpdatePopNode();
     
@@ -729,33 +791,15 @@ SNum PopGraph::GetOutterConn(SNum nSrcPart,SNum nDstPart,SYN_BUILD *builds,SNum 
         pop2=mConns[i].pop2;
         if(!mPopIDToArray[nSrcPart].count(pop1) || !mPopIDToArray[nDstPart].count(pop2))
             continue;
-        nSrcPop1=mPopIDToArray[nSrcPart][pop1].second;
-        nDstPop2=mPopIDToArray[nDstPart][pop2].second;
         if(ncount<nBuild && builds)
         {
             if(mConns[i].bOneToOne)
             {
-                nDstPop1=0;
-                nSrcPop2=0;
-                if(mPopIDToArray[nSrcPart].count(pop2))
-                    nSrcPop2=mPopIDToArray[nSrcPart][pop2].second;
-                if(mPopIDToArray[nDstPart].count(pop1))
-                    nDstPop1=mPopIDToArray[nDstPart][pop1].second;
-
-                srcDelta=abs(nSrcPop1-nSrcPop2);
-                dstDelta=abs(nDstPop1-nDstPop2);
-                //目前只适应2GPU的情况
-                if(nSrcPop1<nSrcPop2)
+                p2p.first=nSrcPart;
+                p2p.second=nDstPart;
+                if(!m121ConnBuilds.count(i) || !m121ConnBuilds[i].count(p2p))
                     continue;
-                if(srcDelta!=dstDelta)
-                    return -1;
-                if(srcDelta==0)
-                    continue;
-                builds[ncount].preOffset=mPopIDToArray[nSrcPart][pop1].first+nSrcPop1-srcDelta;
-                builds[ncount].preCount=srcDelta;
-                builds[ncount].postOffset=mPopIDToArray[nDstPart][pop2].first+nDstPop2-dstDelta;
-                builds[ncount].postCount=dstDelta;
-
+                builds[ncount]=m121ConnBuilds[i][p2p];
             }
             else
             {

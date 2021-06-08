@@ -125,6 +125,7 @@ private:
     PopNode *mBestPop;//目前效果最好的划分结果
     MOVE_RECORD mLastBalance;//上一次平衡性移动的数据
 //输出时用的数据
+    std::map<SNum,std::map<std::pair<SNum,SNum>,SYN_BUILD>> m121ConnBuilds;//1对1总连接下标到连接构建数据的映射
     bool mUpdated;//划分是否发生过更新
     NodeMap *mPopIDToArray;//族群id到单个GPU内节点大数组的偏移与长度
 private:
@@ -143,6 +144,7 @@ public:
     SNum Turbulence(SNum ncount,SNum srcPart,SNum dstPart);//扰动，随机选择某个部分的非边界族群，移动指定数目的节点到目标部分
     SNum GetPartCount();
     SNum GetPartNodeCount(SNum index);
+    SNum GetPopCountInPart(SNum pop,SNum part);
     void Partition(SNum turbCount,SFNum turbDecay);//划分的主体部分,count为初始扰动的节点数
     void PrintPartition(bool bPrintBest=false);
     SNum GetInnerConn(SNum nPart,SYN_BUILD *builds,SNum nBuild);//获取展开后的内部连接，返回连接数

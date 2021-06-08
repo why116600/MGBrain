@@ -325,9 +325,9 @@ bool GetSynSection(SNum nBuild,SYN_BUILD *builds,SNum *pNodeCount,SLNum **gSecti
 }
 
 //将突触数据清空成无效突触
-__global__ void CleanSynapseData(SNum nSyn,SYNAPSE *syns)
+__global__ void CleanSynapseData(SLNum nSyn,SYNAPSE *syns)
 {
-    SNum synIdx=blockDim.x*blockIdx.x+threadIdx.x;
+    SLNum synIdx=blockDim.x*blockIdx.x+threadIdx.x;
 
     while(synIdx<nSyn)
     {
@@ -365,8 +365,8 @@ __global__ void gpuBuildPopSynapse(SNum nNodeCount,SNum nBuild,SYN_BUILD *builds
 {
     SNum nodeIdx=blockDim.x*blockIdx.x+threadIdx.x;
     SNum offset,preStart;
-    SNum i,j,pos,n;
-    SNum pOffset;
+    SNum i,j,n;
+    SLNum pOffset,pos;
     SLNum idx1,idx2,xi;
     SLNum end;//当前神经元的输出突触数组的结束位置
     double p;
@@ -387,10 +387,10 @@ __global__ void gpuBuildPopSynapse(SNum nNodeCount,SNum nBuild,SYN_BUILD *builds
     if(sections[nodeIdx+preStart]>=(gpuOffset+gpuLen) || sections[nodeIdx+preStart+1]<gpuOffset)
         return;
 
-    if(gpuOffset>0 && sections[nodeIdx+preStart]<=gpuOffset)
+    /*if(gpuOffset>0 && sections[nodeIdx+preStart]<=gpuOffset)
     {
         printf("node=%d,offset=%lu,gpuOffset=%lu\n",nodeIdx,sections[nodeIdx+preStart],gpuOffset);
-    }
+    }*/
     offset=GetDelta(sections[nodeIdx+preStart],gpuOffset);
     end=GetDelta(sections[nodeIdx+preStart+1],gpuOffset);
     /*if(nodeIdx==0)
@@ -453,7 +453,7 @@ __global__ void gpuBuildPopSynapse(SNum nNodeCount,SNum nBuild,SYN_BUILD *builds
             p=builds[i].fPropa;
             idx1=GetSynStartIndex(&builds[i],nodeIdx);
             idx2=idx1+builds[i].postCount;
-            pOffset=(SNum)ceil(p*idx1);
+            pOffset=(SLNum)ceil(p*idx1);
             n=(SNum)(ceil(p*(idx2-1))-ceil(p*idx1));
             for(j=0,pos=pOffset;j<n;j++,pos++)
             {
@@ -461,8 +461,12 @@ __global__ void gpuBuildPopSynapse(SNum nNodeCount,SNum nBuild,SYN_BUILD *builds
                     continue;
                 xi=(SLNum)ceil(pos/p);
                 if(xi<idx1 || (xi-idx1)>builds[i].postCount)
-                printf("Wrong propa[%d] n=%d,idx1=%lu,pOffset=%d,xi=%ld,pos=%d,postcount=%d\n",\
-                j,n,idx1,pOffset,xi,pos,builds[i].postCount);
+                {
+                printf("Wrong propa[%d] n=%d,idx1=%llu,pOffset=%llu:%llu,xi=%llu,pos=%llu,postcount=%d\n",\
+                j,n,idx1,pOffset,(SLNum)ceil(p*idx1),xi,pos,builds[i].postCount);
+                //if(gpuOffset>0)
+                //printf("gpu offset:%llu\n",gpuOffset);
+                }
                 
                 if((offset+j)>=end || (offset+j)>=gpuLen)
                 {
@@ -488,7 +492,7 @@ __global__ void gpuBuildPopSynapse(SNum nNodeCount,SNum nBuild,SYN_BUILD *builds
     }
 }
 
-bool BuildSynapse(SNum nBuild,SYN_BUILD builds[],SNum *pNodeCount,SLNum **gSections,MultiGPUBrain::MemSchedule<SYNAPSE> **gSynapses,SNum *nMaxSynCount,SNum nMeshSize)
+bool BuildSynapse(SNum nBuild,SYN_BUILD builds[],SNum *pNodeCount,SLNum **gSections,MultiGPUBrain::MemSchedule<SYNAPSE> **gSynapses,SNum *nMaxSynCount,SLNum nGridSize,SNum nMeshSize)
 {
     SNum nNodes=0;//总共的节点数
     SNum nPop=0;
@@ -517,8 +521,8 @@ bool BuildSynapse(SNum nBuild,SYN_BUILD builds[],SNum *pNodeCount,SLNum **gSecti
             return false;
         if(builds[i-1].preOffset==builds[i].preOffset)
         {
-            if(builds[i-1].preCount!=builds[i].preCount)//同一组突触前神经元节点不能数量不同
-                return false;
+            //if(builds[i-1].preCount!=builds[i].preCount)//同一组突触前神经元节点不能数量不同
+                //return false;
             if(builds[i-1].postOffset>builds[i].postOffset)//同一组突触前神经元的突触后神经元必须升序
                 return false;
         }
@@ -589,7 +593,7 @@ bool BuildSynapse(SNum nBuild,SYN_BUILD builds[],SNum *pNodeCount,SLNum **gSecti
         }
     }
     //printf("allocate synapses' buffer[%p] with size=%llu\n",gSynapses,nSyn);
-    *gSynapses=MultiGPUBrain::MemSchedule<SYNAPSE>::AllocateMemory(nSyn);
+    *gSynapses=MultiGPUBrain::MemSchedule<SYNAPSE>::AllocateMemory(nSyn,nGridSize);
     CUDACHECK(cudaGetLastError());
     if(!(*gSynapses))
     {
