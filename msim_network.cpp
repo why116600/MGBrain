@@ -165,7 +165,7 @@ void Network::CopyNodesToSimulator(Simulator *pSim,std::vector<Population> pops[
     }
 }
 
-bool Network::Compile(SNum nPart,SNum meshSize,SFNum minDelay,SNum nBlockSize)
+bool Network::Compile(SNum nPart,PARTITION_MODEL pm,SNum meshSize,SFNum minDelay,SNum nBlockSize)
 {
     SNum i,j,type,pos,index,popIndex,preIndex,postIndex,len,offset;
     SNum synCount=0,nodeCount=0;
@@ -255,8 +255,19 @@ bool Network::Compile(SNum nPart,SNum meshSize,SFNum minDelay,SNum nBlockSize)
             nodeCount+=mPops[TYPE_LIF][i].mCount;
         }
         srand(time(NULL));
-        pg.StartPartition(nPart);
-        pg.Partition(nodeCount/10,0.1);
+        switch(pm)
+        {
+        case LoadBalance:
+            pg.StartPartition(nPart);
+            pg.Partition(nodeCount/10,0.1);
+            break;
+        case FIFP:
+            pg.StartPartition(nPart,false);
+            break;
+        case Average:
+            pg.StartPartition(nPart);
+            break;
+        }
         mSimulators=new Simulator[nPart];
         for(i=0;i<nPart;i++)
         {
@@ -346,6 +357,7 @@ bool Network::Compile(SNum nPart,SNum meshSize,SFNum minDelay,SNum nBlockSize)
         mSimulators->mGPUID=0;
         mSimulators->mMaxDelay=mMaxDelay;
         mSimulators->mMinDelay=mMinDelay;
+        mSimulators->UseMyGPU();
         SYN_BUILD builds[mSynapses.size()];
         for(i=0;i<(SNum)mSynapses.size();i++)
         {
@@ -439,6 +451,7 @@ compile_end:
 	    CUDACHECK(cudaGetLastError());
         mSimulators[i].Reset();
 	    CUDACHECK(cudaGetLastError());
+        //重置输入脉冲进度
         for(std::map<SNum,std::pair<SNum,std::vector<SFNum>>>::iterator it=mGenSpikeTrains[i].begin();
         it!=mGenSpikeTrains[i].end();it++)
         {
@@ -458,13 +471,13 @@ compile_end:
             it!=mGenSpikeTrains[i].end();it++)
             {
                 if(it->second.first< it->second.second.size() && \
-                it->second.second[it->second.first]>now[i])
+                it->second.second[it->second.first]<=(now[i]+mMinDelay))
                 {
                     ngen.pos=0;
                     ngen.length=0;
                     for(SNum j=0;j<MAX_SPIKE_COUNT && (it->second.first+j)<it->second.second.size();j++)
                     {
-                        ngen.spikes[j]=it->second.second[it->second.first+j];
+                        ngen.spikes[j]=(SNum)(it->second.second[it->second.first+j]/mTimestep);
                         ngen.length++;
                     }
                     it->second.first+=ngen.length;
@@ -527,7 +540,7 @@ bool Network::SetSpikeTrain(SNum genID,const std::vector<SFNum> &spikes)
     popIndex=GETNO(genID);
     if(type!=TYPE_GEN)
         return false;
-    if(!LocateNeuron(genID,popIndex,neuron))
+    if(!LocateNeuron(genID,0,neuron))
         return false;
 
     /*gen.length=spikes.size()<MAX_SPIKE_COUNT?(SNum)spikes.size():MAX_SPIKE_COUNT;
@@ -585,6 +598,26 @@ bool Network::GetNeuronSpikes(SNum popID,SNum index,std::vector<SFNum> &times)
     {
         times.push_back(gen.spikes[i]);
     }
+    return true;
+}
+
+bool Network::GetSynapseInfo(SNum preID,SNum preIndex,SNum postID,SNum postIndex,SYNAPSE *pSyn)
+{
+    std::pair<SNum,SNum> pre,post;
+    if(!mSimulators)
+        return false;
+
+    if(!LocateNeuron(preID,preIndex,pre))
+        return false;
+
+    if(!LocateNeuron(postID,postIndex,post))
+        return false;
+
+    SYNAPSE *pS;
+    pS=mSimulators[pre.first].GetSynapses(pre.second,post.second);
+    if(!pS)
+        return false;
+    memcpy(pSyn,pS,sizeof(SYNAPSE));
     return true;
 }
 

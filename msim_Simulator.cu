@@ -70,7 +70,10 @@ void Simulator::UseMyGPU()
 #ifndef FAKE_MULTI_GPU
 	if(mGPUID>=0)
 	{
-		CUDACHECK(cudaSetDevice(mGPUID));
+		SNum gpuCount;
+		CUDACHECK(cudaGetDeviceCount(&gpuCount));
+		//CUDACHECK(cudaSetDevice(mGPUID));
+		CUDACHECK(cudaSetDevice(gpuCount-1-mGPUID));
 		/*int gpuid;
 		cudaGetDevice(&gpuid);
 		printf("Simulator[%p] uses GPU%d\n",this,gpuid);*/
@@ -87,6 +90,7 @@ void Simulator::UpdateNodeOffset()
 		mNodeOffsets[i+1]=mNodeOffsets[i]+mNodeCounts[i];
 	mNodeChanged=false;
 }
+
 
 void Simulator::CleanLIF()
 {
@@ -113,6 +117,7 @@ void Simulator::CleanOutputSynapse()
 {
 	for(SNum i=0;i<(SNum)mOutputSyn.size();i++)
 	{
+		if(mOutputSynData.size()>i)
 		delete mOutputSynData[i];
 		//if(mOutputSyn[i].gSynapses)
 			//cudaFree(mOutputSyn[i].gSynapses);
@@ -184,6 +189,10 @@ void Simulator::CleanSimulData()
     if(mgActiveCount)
         cudaFree(mgActiveCount);
 	mgActiveCount=NULL;
+
+	if(mgActiveCountByGrid)
+		cudaFree(mgActiveCountByGrid);
+	mgActiveCountByGrid=NULL;
 	
     if(mgActiveIndex)
         cudaFree(mgActiveIndex);
@@ -192,7 +201,8 @@ void Simulator::CleanSimulData()
 
 bool Simulator::SetSpikeGenerator(GNGen *gens,SNum len)
 {
-    mNodeCounts[TYPE_GEN]=len;
+	mNodeCounts[TYPE_GEN]=len;
+	mPopCount[TYPE_GEN]=len;
 	SetToGPU((void **)&mgGens,gens,sizeof(GNGen)*len);
 	return true;
 }
@@ -205,6 +215,7 @@ bool Simulator::SetSpikeGenerator(SNum index,const GNGen &gens)
 		return false;
 
 	CUDACHECK(cudaMemcpy(mgGens+index,&gens,sizeof(GNGen),cudaMemcpyHostToDevice));
+	
 	return true;
 }
 
@@ -223,8 +234,9 @@ bool Simulator::SetLIFNodes(GNLIF *lifs,SNum nLIF,LIF_ARG *lifArg,SNum nLifArg)
     }
 	CleanLIF();
 	mNodeChanged=true;
-    mNodeCounts[TYPE_LIF]=nLIF;
-    SetToGPU((void **)&mgLIF,lifs,sizeof(GNLIF)*((nLIF+MAXLIF-1)/MAXLIF));
+	mNodeCounts[TYPE_LIF]=nLIF;
+	mPopCount[TYPE_LIF]=nLifArg;
+	SetToGPU((void **)&mgLIF,lifs,sizeof(GNLIF)*((nLIF+MAXLIF-1)/MAXLIF));
     SetToGPU((void **)&mgLifArg,lifArg,sizeof(LIF_ARG)*nLifArg);
     return true;
 }
@@ -246,11 +258,29 @@ int StatisticSynapses(SNum index,SNum nNodes,SNum *gSections,SYNAPSE *gSynapses)
 	return ret;
 }
 
+SLNum GetSynCount(SNum nBuild,SYN_BUILD builds[])
+{
+	SLNum ret=0;
+	for(SNum i=0;i<nBuild;i++)
+	{
+		if(builds[i].bOneToOne)
+		{
+			if(builds[i].preCount<builds[i].postCount)
+				ret+=builds[i].preCount;
+			else
+				ret+=builds[i].postCount;
+		}
+		else
+		{
+			ret+=(SLNum)ceil((double)builds[i].preCount*(double)builds[i].postCount*(double)builds[i].fPropa);
+		}
+	}
+	return ret;
+}
+
 bool Simulator::SetSynapse(SNum nBuild,SYN_BUILD builds[])
 {
-    SNum nodeCount;
     UpdateNodeOffset();
-    nodeCount=mNodeOffsets[TYPE_COUNT];
 	if(mMaxDelay<0 || mMinDelay<0)
     	mMaxDelay=mMinDelay=builds[0].delay;
     for(SNum i=0;i<nBuild;i++)
@@ -262,8 +292,22 @@ bool Simulator::SetSynapse(SNum nBuild,SYN_BUILD builds[])
 		//if(mGPUID==0)
 		//printf("map inner synapses:%d->%d,%d\n",builds[i].preOffset,builds[i].postOffset,builds[i].postCount);
 	}
+	if(mInnerBuild)
+		delete []mInnerBuild;
+	mInnerBuildCount=nBuild;
+	mInnerBuild=new SYN_BUILD[nBuild];
+	memcpy(mInnerBuild,builds,sizeof(SYN_BUILD)*nBuild);
+    return true;
+}
+
+bool Simulator::BuildInnerSynapse()
+{
+    SNum nodeCount;
+    nodeCount=mNodeOffsets[TYPE_COUNT];
 	//printf("Simulator %d SetSynapse\n",mGPUID);
-    if(!BuildSynapse(nBuild,builds,&nodeCount,&mgSections,&mgSynapses,NULL,mMeshSize))
+	if(mInnerGridSize)
+		printf("Simulator %d has %llu inner synapse grid size\n",mGPUID,mInnerGridSize);
+    if(!BuildSynapse(mInnerBuildCount,mInnerBuild,&nodeCount,&mgSections,&mgSynapses,NULL,mInnerGridSize,mMeshSize))
     {
         return false;
 	}
@@ -275,7 +319,15 @@ bool Simulator::SetSynapse(SNum nBuild,SYN_BUILD builds[])
     }
 	if(mgSynapses && mgSynapses->GetGridSize()>mMaxGrid)
 		mMaxGrid=mgSynapses->GetGridSize();
+
+	mInnerBuildCount=0;
+	if(mInnerBuild)
+	{
+		delete []mInnerBuild;
+		mInnerBuild=NULL;
+	}
     return true;
+
 }
 
 bool Simulator::SetOutputSynapse(SNum nBuild,SYN_BUILD builds[],Simulator *pTarget)
@@ -283,14 +335,12 @@ bool Simulator::SetOutputSynapse(SNum nBuild,SYN_BUILD builds[],Simulator *pTarg
 	POP_MAPS gpm={0};
 	POP_TO_ARRAY *ptas;
 	OUTPUT_SYNAPSES os={0};
-	OUTPUT_SYNAPSES *pOS;
-	MemSchedule<SYNAPSE> *pMS;
+	std::pair<SNum,SYN_BUILD *> buildItem;
 	PopMap pm;
-	SNum nodeCount,t;
+	SNum t;
 	if(nBuild<=0)
 		return true;
 	UpdateNodeOffset();
-    nodeCount=mNodeOffsets[TYPE_COUNT];
 	if(mMaxDelay<0 || mMinDelay<0)
     	mMaxDelay=mMinDelay=builds[0].delay;
     for(SNum i=0;i<nBuild;i++)
@@ -320,17 +370,9 @@ bool Simulator::SetOutputSynapse(SNum nBuild,SYN_BUILD builds[],Simulator *pTarg
 	//for(SNum i=0;i<nBuild && mGPUID==1;i++)
 		//printf("build from (%d,%d) to (%d,%d)\n",builds[i].preOffset,builds[i].preCount,builds[i].postOffset,builds[i].postCount);
 	os.nDstNode=pm.GetArrayLength();
-	pOS=new OUTPUT_SYNAPSES;
-    if(!BuildSynapse(nBuild,builds,&nodeCount,&pOS->gSections,&pMS,&os.nMaxSynCount))
-    {
-		printf("Build synapse failed!\n");
-		delete pOS;
-        return false;
-	}
-	os.gSections=pOS->gSections;
-	os.gSynapses=pMS->GetGPUBuffer();//pOS->gSynapses;
-	os.nGridSize=pMS->GetGPULen();
-	delete pOS;
+	buildItem.first=nBuild;
+	buildItem.second=new SYN_BUILD[nBuild];
+	memcpy(buildItem.second,builds,sizeof(SYN_BUILD)*nBuild);
 	//在对方建立相应的GPU内数据结构，以便对方在核函数TransferSpikes中接收
 	ptas=new POP_TO_ARRAY[pm.GetCount()];
 	for(SNum i=0;i<pm.GetCount();i++)
@@ -361,12 +403,121 @@ bool Simulator::SetOutputSynapse(SNum nBuild,SYN_BUILD builds[],Simulator *pTarg
 		//UseMyGPU();
 	}
 #endif
-	if(pMS->GetGridSize()>mMaxGrid)
-		mMaxGrid=pMS->GetGridSize();
-	mOutputSynData.push_back(pMS);
+	mOutterBuilds.push_back(buildItem);
 	mOutputSyn.push_back(os);
 	mInToOuts.push_back(pm);
     return true;
+}
+
+bool Simulator::BuildOutterSynapse()
+{
+	SNum nodeCount;
+	SNum nBuild;
+	SYN_BUILD *builds;
+	OUTPUT_SYNAPSES os={0};
+	OUTPUT_SYNAPSES *pOS;
+	MemSchedule<SYNAPSE> *pMS;
+	for(SNum i=0;i<(SNum)mOutterBuilds.size();i++)
+	{
+		nBuild=mOutterBuilds[i].first;
+		builds=mOutterBuilds[i].second;
+		os=mOutputSyn[i];
+		if(os.nGridSize)
+			printf("Outter synapses from %d to %d has grid size:%llu\n",\
+			mGPUID,((Simulator *)os.pTarget)->mGPUID,os.nGridSize);
+		pOS=new OUTPUT_SYNAPSES;
+		if(!BuildSynapse(nBuild,builds,&nodeCount,&pOS->gSections,&pMS,&os.nMaxSynCount,os.nGridSize))
+		{
+			printf("Build synapse failed!\n");
+			delete pOS;
+			CleanOutterBuilds();
+			return false;
+		}
+		os.gSections=pOS->gSections;
+		os.gSynapses=pMS->GetGPUBuffer();//pOS->gSynapses;
+		os.nGridSize=pMS->GetGPULen();
+		mOutputSyn[i]=os;
+		delete pOS;
+	
+		if(pMS->GetGridSize()>mMaxGrid)
+			mMaxGrid=pMS->GetGridSize();
+		mOutputSynData.push_back(pMS);
+	}
+	CleanOutterBuilds();
+	return true;
+}
+
+bool Simulator::PrepareSynapseSize()
+{
+	size_t a,t;
+	SNum n;
+	OUTPUT_SYNAPSES os;
+	SFNum rate;
+	SLNum wholeSynSize,s;
+	SLNum innerSynSize;
+	std::vector<SLNum> outterSynSize;
+	SLNum avail;
+	SLNum runtimeSize=0;
+	SLNum nodeSize=0;
+	mInnerGridSize=0;
+	//计算节点所需要的显存空间大小
+	nodeSize+=sizeof(GNGen)*mNodeCounts[TYPE_GEN];
+	nodeSize+=sizeof(LIF_ARG)*mPopCount[TYPE_LIF];
+	nodeSize+=sizeof(GNLIF)*((mNodeCounts[TYPE_LIF]+MAXLIF-1)/MAXLIF);
+	nodeSize+=sizeof(SLNum)*(mNodeOffsets[TYPE_COUNT]+1);
+	//计算仿真过程中需要的运行时显存空间大小
+	runtimeSize+=sizeof(NETWORK_DATA);
+	for(SNum i=0;i<(SNum)mOutputSyn.size();i++)
+	{
+		os=mOutputSyn[i];
+		mOutputSyn[i].nGridSize=0;
+		runtimeSize+=sizeof(SFNum)*os.nDstNode*(mGroupLength*mCurrentGroupCount+mMaxTSDelay);
+	}
+	runtimeSize+=sizeof(NSPIKE_GEN)*mNodeOffsets[TYPE_COUNT];
+	runtimeSize+=sizeof(SFNum)*(mCurrentGroupCount*mGroupLength+mMaxTSDelay)*mNodeOffsets[TYPE_COUNT];
+	runtimeSize+=sizeof(SNum)*mCurrentGroupCount;
+	runtimeSize+=sizeof(SNum)*mGroupLength*mNodeOffsets[TYPE_COUNT];
+
+	n=(SNum)mOutsToIn.size();
+	runtimeSize+=sizeof(POP_MAPS)*n;
+	for(SNum i=0;i<n;i++)
+		runtimeSize+=sizeof(POP_TO_ARRAY)*mOutsToIn[i].ncount;
+
+	CUDACHECK(cudaMemGetInfo(&a,&t));
+	avail=(SLNum)a;
+	if(avail<=(nodeSize+runtimeSize-sizeof(SYNAPSE)*(1+mOutterBuilds.size())))
+		return false;
+	avail-=(nodeSize+runtimeSize);
+	avail=(SLNum)((SFNum)avail*0.8f);
+	innerSynSize=sizeof(SYNAPSE)*GetSynCount(mInnerBuildCount,mInnerBuild);
+	wholeSynSize=innerSynSize;
+	for(SNum i=0;i<(SNum)mOutterBuilds.size();i++)
+	{
+		s=sizeof(SYNAPSE)*GetSynCount(mOutterBuilds[i].first,mOutterBuilds[i].second);
+		outterSynSize.push_back(s);
+		wholeSynSize+=s;
+	}
+	printf("Part %d needs %llu bytes to save nodes, %llu bytes to run, %llu bytes to save synapses\n",\
+	mGPUID,nodeSize,runtimeSize,wholeSynSize);
+	if(wholeSynSize<=avail)
+		return true;
+	printf("Part %d needs synapse swope,available memory size:%llu\n",mGPUID,avail);
+	rate=(SFNum)avail/(SFNum)wholeSynSize;
+	innerSynSize=(SLNum)((SFNum)innerSynSize*rate);
+	mInnerGridSize=innerSynSize/sizeof(SYNAPSE);
+	if(mInnerGridSize<=0)
+		mInnerGridSize=1;
+
+	for(SNum i=0;i<(SNum)mOutputSyn.size();i++)
+	{
+		s=outterSynSize[i];
+		s=(SLNum)((SFNum)s*rate);
+		mOutputSyn[i].nGridSize=s/sizeof(SYNAPSE);
+		if(mOutputSyn[i].nGridSize<=0)
+			mOutputSyn[i].nGridSize=1;
+	}
+	
+	return true;
 }
 
 bool Simulator::Prepare(SFNum timestep,SNum nTSGroupLen,SNum nTSMaxDelay,SNum nBlockSize)
@@ -394,7 +545,14 @@ bool Simulator::Prepare(SFNum timestep,SNum nTSGroupLen,SNum nTSMaxDelay,SNum nB
 		mMaxTSDelay=nTSMaxDelay;
 	else
 		mMaxTSDelay=(SNum)(mMaxDelay/timestep);
-    UpdateNodeOffset();
+	UpdateNodeOffset();
+	if(!PrepareSynapseSize())
+		return false;
+	//正式构建网络
+	if(!BuildInnerSynapse())
+		return false;
+	if(!BuildOutterSynapse())
+		return false;
     memcpy(network.offset,mNodeOffsets,(TYPE_COUNT+1)*sizeof(SNum));
     if(mgSections)
     {
@@ -441,7 +599,9 @@ bool Simulator::Prepare(SFNum timestep,SNum nTSGroupLen,SNum nTSMaxDelay,SNum nB
     CUDACHECK(cudaMalloc(&mgCurrent,sizeof(SFNum)*(mCurrentGroupCount*mGroupLength+mMaxTSDelay)*mNodeOffsets[TYPE_COUNT]));
     CUDACHECK(cudaMemset(mgCurrent,0,sizeof(SFNum)*(mCurrentGroupCount*mGroupLength+mMaxTSDelay)*mNodeOffsets[TYPE_COUNT]));
     CUDACHECK(cudaMalloc(&mgActiveCount,sizeof(SNum)*mCurrentGroupCount));
-    CUDACHECK(cudaMemset(mgActiveCount,0,sizeof(SNum)*mCurrentGroupCount));
+	CUDACHECK(cudaMemset(mgActiveCount,0,sizeof(SNum)*mCurrentGroupCount));
+    CUDACHECK(cudaMalloc(&mgActiveCountByGrid,sizeof(SNum)*mMaxGrid));
+	CUDACHECK(cudaMemset(mgActiveCountByGrid,0,sizeof(SNum)*mMaxGrid));
     CUDACHECK(cudaMalloc(&mgActiveIndex,sizeof(SNum)*mGroupLength*mNodeOffsets[TYPE_COUNT]));
 	CUDACHECK(cudaMemset(mgActiveIndex,0,sizeof(SNum)*mGroupLength*mNodeOffsets[TYPE_COUNT]));
 	
@@ -464,8 +624,8 @@ bool Simulator::Prepare(SFNum timestep,SNum nTSGroupLen,SNum nTSMaxDelay,SNum nB
 }
 
 __global__ void simulateAndPush(NETWORK_DATA *network,NSPIKE_GEN *neuronSpikes,SFNum *currentBuf,\
-	SNum *activeNum,SNum *activePreIndex,SNum nGroupLength,SNum now,SNum currentPos,SFNum timestep,\
-	bool bSelectActiveNeuron,SNum GPUID,SLNum synGridPos)
+	SNum *activeGridNum,SNum *activeNum,SNum *activePreIndex,SNum nGroupLength,SNum now,SNum currentPos,\
+	SFNum timestep,bool bSelectActiveNeuron,SNum GPUID,SLNum synGridPos)
 {
 	//unsigned int threadID=blockIdx.x*blockDim.x+threadIdx.x;
 	SLNum synStart,synEnd,osynStart,osynEnd;
@@ -507,6 +667,7 @@ __global__ void simulateAndPush(NETWORK_DATA *network,NSPIKE_GEN *neuronSpikes,S
 				if(simulateLIF(index-network->offset[TYPE_LIF],nowCurrent,network->LIF,network->LIFArgs,i,timestep,NULL))
 				{
 					//if(endS>startS || network->nOutput>0)
+					//if(index==network->offset[TYPE_LIF])
 					//printf("fired at %d-%d with %d output synapses\n",now,i,network->nOutput);
 					network->lastFired=i;
 					bFired=true;
@@ -516,6 +677,7 @@ __global__ void simulateAndPush(NETWORK_DATA *network,NSPIKE_GEN *neuronSpikes,S
 			{
 				if(simulateSpikeGen(index,network->gen,NULL,now*nGroupLength+i))
 				{
+					//printf("input spike at %d-%d with %d output synapses\n",now,i,network->nOutput);
 					network->lastFired=i;
 					bFired=true;
 				}
@@ -525,10 +687,17 @@ __global__ void simulateAndPush(NETWORK_DATA *network,NSPIKE_GEN *neuronSpikes,S
 			{
 				if(neuronSpikes && neuronSpikes[index].length<MAX_SPIKE_COUNT)
 					neuronSpikes[index].spikes[neuronSpikes[index].length++]=(SFNum)(now*nGroupLength+i)*timestep;
+				atomicAdd(&activeGridNum[startS/network->nGridSize],1);
+				atomicAdd(&activeGridNum[(endS-1)/network->nGridSize],1);
+				for(j=0;j<network->nOutput;j++)
+				{
+					atomicAdd(&activeGridNum[network->outputs[j].gSections[index]/network->outputs[j].nGridSize],1);
+					atomicAdd(&activeGridNum[(network->outputs[j].gSections[index+1]-1)/network->outputs[j].nGridSize],1);
+				}
 				if(bSelectActiveNeuron)
 				{
 					pos=atomicAdd(activeNum,1);
-					activePreIndex[pos+neuronCount*i]=index+i*neuronCount;
+					activePreIndex[pos]=index+i*neuronCount;
 				}
 				else
 				{
@@ -595,7 +764,7 @@ __global__ void simulateAndPush(NETWORK_DATA *network,NSPIKE_GEN *neuronSpikes,S
 	}
 }
 
-__global__ void push_spike(NETWORK_DATA *network,SFNum *currentBuf,SNum *activeNum,SNum *activePreIndex,SNum nGroupLength,SNum currentPos,SFNum timestep,SLNum synGridPos)
+__global__ void push_spike(NETWORK_DATA *network,SFNum *currentBuf,SNum *activeNum,SNum *activePreIndex,SNum nGroupLength,SNum currentPos,SFNum timestep,SLNum synGridPos,SNum GPUID)
 {
 	unsigned long long pos=blockIdx.x*blockDim.x+threadIdx.x;
 	SNum index;
@@ -611,11 +780,15 @@ __global__ void push_spike(NETWORK_DATA *network,SFNum *currentBuf,SNum *activeN
 	unsigned long long activeSynCount=(unsigned long long)(*activeNum)*maxSyn;
 	while(pos<activeSynCount)
 	{
+		index=pos/maxSyn;
+		if(index>=(*activeNum))
+		{
+			break;
+		}
+		neuron=activePreIndex[index]%neuronCount;
+		syn=pos%maxSyn;
 		if(network->maxSynapseCount>0)//发放内部预定突触的脉冲
 		{
-			index=pos/network->maxSynapseCount;
-			neuron=activePreIndex[index]%neuronCount;
-			syn=pos%network->maxSynapseCount;
 			synStart=network->nGridSize*synGridPos;
 			synEnd=synStart+network->nGridSize;
 			startS=network->section[neuron];
@@ -642,9 +815,9 @@ __global__ void push_spike(NETWORK_DATA *network,SFNum *currentBuf,SNum *activeN
 		}
 		if(network->node2Syn)//发放内部额外突触的脉冲
 		{
-			index=pos/network->maxExtraCount;
-			neuron=activePreIndex[index]%neuronCount;
-			syn=pos%network->maxExtraCount;
+			//index=pos/network->maxExtraCount;
+			//neuron=activePreIndex[index]%neuronCount;
+			//syn=pos%network->maxExtraCount;
 			mesh=network->node2Syn[neuron];
 			for(i=0;mesh>=0 && i<syn/network->meshSize;i++)
 			{
@@ -667,9 +840,9 @@ __global__ void push_spike(NETWORK_DATA *network,SFNum *currentBuf,SNum *activeN
 		{
 			if(network->outputs[i].nMaxSynCount<=0)
 				continue;
-			index=pos/network->outputs[i].nMaxSynCount;
-			neuron=activePreIndex[index]%neuronCount;
-			syn=pos%network->outputs[i].nMaxSynCount;
+			//index=pos/network->outputs[i].nMaxSynCount;
+			//neuron=activePreIndex[index]%neuronCount;
+			//syn=pos%network->outputs[i].nMaxSynCount;
 			synStart=network->outputs[i].nGridSize*synGridPos;
 			synEnd=synStart+network->outputs[i].nGridSize;
 			startS=network->outputs[i].gSections[neuron];
@@ -689,7 +862,8 @@ __global__ void push_spike(NETWORK_DATA *network,SFNum *currentBuf,SNum *activeN
 			delay=(SNum)(network->outputs[i].gSynapses[j].delay/timestep);
 			postTime=k+delay;
 			postPos=postTime*network->outputs[i].nDstNode+network->outputs[i].gSynapses[j].postIndex;
-			atomicAdd(&network->outputs[i].gCurrentBuffer[postPos+currentPos*network->outputs[i].nDstNode*nGroupLength],network->outputs[i].gSynapses[j].weight);
+			k=postPos+currentPos*network->outputs[i].nDstNode*nGroupLength;
+			atomicAdd(&network->outputs[i].gCurrentBuffer[k],network->outputs[i].gSynapses[j].weight);
 		}
 		pos+=blockDim.x * gridDim.x;
 		//bufOffset+=neuronCount;
@@ -702,10 +876,13 @@ bool Simulator::Simulate(bool bSelectActiveNeuron)
 	OUTPUT_SYNAPSES os;
 	SNum currentPos;
 	SNum blockSize;
+	SNum lastGrid;
+	SNum activeGridNum[mMaxGrid];
+	std::vector<SLNum> gridToHandle;//将要调度来做脉冲发放的格子
 	CUDACHECK(cudaGetLastError());
 	if(mCurrentGroupCount>0)
 		currentPos=mNowTSGroup%mCurrentGroupCount;
-	if(currentPos==0 && mNowTSGroup>0 && mCurrentGroupCount>0)
+	if(currentPos==0 && mNowTSGroup>0 && mCurrentGroupCount>0)//重置仿真过程的数据
 	{
 		//CUDACHECK(cudaDeviceSynchronize());
 		CUDACHECK(cudaMemset(mgActiveCount,0,sizeof(SNum)*mCurrentGroupCount));
@@ -720,6 +897,8 @@ bool Simulator::Simulate(bool bSelectActiveNeuron)
 			CUDACHECK(cudaMemset(&os.gCurrentBuffer[os.nDstNode*mMaxTSDelay],0,sizeof(SFNum)*os.nDstNode*mGroupLength*mCurrentGroupCount));
 		}
 	}
+	if(mMaxGrid>1)//如果需要调度，则需要使用每个调度格子的记录情况，在仿真之前需要清空
+		CUDACHECK(cudaMemset(mgActiveCountByGrid,0,sizeof(SNum)*mMaxGrid));
 	blockSize=MYGRID_SIZE(mNodeOffsets[TYPE_COUNT],mBlockSize);
 	if(blockSize>mMaxBlock)
 		blockSize=mMaxBlock;
@@ -727,11 +906,31 @@ bool Simulator::Simulate(bool bSelectActiveNeuron)
 	if(mgSynapses)
 		mgSynapses->SwitchToGrid(0);
 	simulateAndPush<<<blockSize,mBlockSize>>>(mgNetwork,mgRecorder,&mgCurrent[currentPos*mNodeOffsets[TYPE_COUNT]*mGroupLength],\
-		&mgActiveCount[currentPos],mgActiveIndex,mGroupLength,mNowTSGroup,currentPos,mTimestep,bSelectActiveNeuron,mGPUID,0);
+		mgActiveCountByGrid,&mgActiveCount[currentPos],mgActiveIndex,mGroupLength,mNowTSGroup,currentPos,mTimestep,bSelectActiveNeuron,mGPUID,0);
 	cudaError_t err=cudaGetLastError();
 	CUDACHECK(err);
-	for(SLNum i=0;i<mMaxGrid;i++)
+	if(mMaxGrid>1)//如果需要调度，则需要判断当前是否存在要发放脉冲的神经元
 	{
+		err=cudaDeviceSynchronize();
+		CUDACHECK(err);
+		CUDACHECK(cudaMemcpy(activeGridNum,mgActiveCountByGrid,sizeof(SNum)*mMaxGrid,cudaMemcpyDeviceToHost));
+		//CUDACHECK(cudaMemcpy(&activeNum,&mgActiveCount[currentPos],sizeof(SNum),cudaMemcpyDeviceToHost));
+	}
+	else
+	{
+		activeGridNum[0]=1;
+	}
+	//先确定有哪些格子需要调度
+	lastGrid=mgSynapses->GetGridPos();
+	gridToHandle.push_back(lastGrid);//先完成之前的调度格子
+	for(SNum i=0;i<mMaxGrid;i++)
+	{
+		if(activeGridNum[i]<=0 || i==lastGrid)
+			continue;
+	}
+	for(SNum ii=0;ii<(SNum)gridToHandle.size();ii++)
+	{
+		SLNum i=gridToHandle[ii];
 		if(mgSynapses)
 			mgSynapses->SwitchToGrid(i);
 		for(SNum j=0;j<mOutputSynData.size();j++)
@@ -742,12 +941,12 @@ bool Simulator::Simulate(bool bSelectActiveNeuron)
 		if(bSelectActiveNeuron)
 		{
 			push_spike<<<blockSize,mBlockSize>>>(mgNetwork,&mgCurrent[currentPos*mNodeOffsets[TYPE_COUNT]*mGroupLength],\
-				&mgActiveCount[currentPos],mgActiveIndex,mGroupLength,currentPos,mTimestep,i);
+				&mgActiveCount[currentPos],mgActiveIndex,mGroupLength,currentPos,mTimestep,i,mGPUID);
 		}
 		else if(i>0)
 		{
 			simulateAndPush<<<blockSize,mBlockSize>>>(mgNetwork,mgRecorder,&mgCurrent[currentPos*mNodeOffsets[TYPE_COUNT]*mGroupLength],\
-				&mgActiveCount[currentPos],mgActiveIndex,mGroupLength,mNowTSGroup,currentPos,mTimestep,bSelectActiveNeuron,mGPUID,\
+				mgActiveCountByGrid,&mgActiveCount[currentPos],mgActiveIndex,mGroupLength,mNowTSGroup,currentPos,mTimestep,bSelectActiveNeuron,mGPUID,\
 				i);
 		}
 		err=cudaGetLastError();
@@ -897,8 +1096,8 @@ void Simulator::MergeSpikes()
 			CUDACHECK(cudaMalloc((LPVOID *)&gCurrent,sizeof(SFNum)*currentEle.nDstNode*copyLen));
 			CUDACHECK(cudaMemcpy(gCurrent,currentEle.currentBuffer,sizeof(SFNum)*currentEle.nDstNode*copyLen,cudaMemcpyHostToDevice));
 		}
-		if(i>0)
-		printf("Merge %d\n",i);
+		//if(i>0)
+		//printf("Merge %d\n",i);
 		TransferSpikesToTarget<<<blockSize,mBlockSize>>>(&mgOutsToIn[currentEle.nDstMap],gCurrent,\
 			&mgCurrent[currentPos*mNodeOffsets[TYPE_COUNT]*mGroupLength],mNodeOffsets[TYPE_COUNT],copyLen,mGPUID);
 		CUDACHECK(cudaGetLastError());

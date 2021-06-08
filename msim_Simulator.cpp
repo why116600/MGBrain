@@ -21,6 +21,7 @@ Simulator::Simulator(SNum nMeshSize)
 ,mgNetwork(NULL)
 ,mgRecorder(NULL)
 ,mgOutsToIn(NULL)
+,mgActiveCountByGrid(NULL)
 ,mNodeChanged(true)
 ,mMinDelay(-1.0f)
 ,mMaxDelay(-1.0f)
@@ -30,21 +31,42 @@ Simulator::Simulator(SNum nMeshSize)
 ,mMeshSize(nMeshSize)
 ,mExtraSyn(NULL)
 ,mMaxGrid(0)
+,mInnerGridSize(0)
+,mInnerBuildCount(0)
+,mInnerBuild(NULL)
 {
     omp_init_lock(&mLock);
     for(SNum i=0;i<TYPE_COUNT;i++)
+    {
         mNodeCounts[i]=0;
+        mPopCount[i]=0;
+    }
 }
 
 Simulator::~Simulator()
 {
     if(mExtraSyn)
         delete mExtraSyn;
+
+	if(mInnerBuild)
+		delete []mInnerBuild;
+
+    CleanOutterBuilds();
     CleanSimulData();
 	CleanSynapse();
 	CleanOutputSynapse();
     CleanLIF();
     omp_destroy_lock(&mLock);
+}
+
+
+void Simulator::CleanOutterBuilds()
+{
+	for(SNum i=0;i<(SNum)mOutterBuilds.size();i++)
+	{
+		delete []mOutterBuilds[i].second;
+	}
+	mOutterBuilds.clear();
 }
 
 void Simulator::Lock()

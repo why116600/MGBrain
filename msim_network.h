@@ -19,6 +19,13 @@ struct POP_IN_PART//描述一个族群的节点在不同分部下的分布情况
     SNum part;
 };
 
+enum PARTITION_MODEL//划分模式
+{
+    LoadBalance,//在负载均衡的情况下尽可能降低不同GPU的通信量
+    FIFP,//先进先划分
+    Average//按GPU平均分
+};
+
 #define BEFORE_PART(a,b) ((a.part<b.part) || (a.part==b.part && a.offset<b.offset))
 
 class Population
@@ -162,12 +169,13 @@ public:
     SNum CreateSpikeGenerator();
     SNum CreatePopulation(const char *szType,SNum nCount,const std::map<std::string,SFNum> &args);
     bool Connect(SNum preID,SNum postID,SFNum weight,SFNum delay,bool bOneToOne,double fProba);
-    bool Compile(SNum nPart,SNum meshSize=1,SFNum minDelay=1.0,SNum nblockSize=BLOCKSIZE);//将网络分为nPart个分部进行编译
+    bool Compile(SNum nPart,PARTITION_MODEL pm=LoadBalance,SNum meshSize=1,SFNum minDelay=1.0,SNum nblockSize=BLOCKSIZE);//将网络分为nPart个分部进行编译
     //以下是完成编译后的操作
     bool SetSpikeTrain(SNum genID,const std::vector<SFNum> &spikes);
     bool WatchNeuron(SNum popID,SNum index);//监视指定的神经元，从而获取完整的脉冲序列
     bool Simulate(SFNum simulTime);//开始仿真
     bool GetNeuronSpikes(SNum popID,SNum index,std::vector<SFNum> &times);//获取指定族群，指定
+    bool GetSynapseInfo(SNum preID,SNum preIndex,SNum postID,SNum postIndex,SYNAPSE *pSyn);//获取指定突触的信息
     bool Connect(SNum preID,SNum preIndex,SNum postID,SNum postIndex,SFNum weight,SFNum delay);//修改或增加指定突触
     bool Disconnect(SNum preID,SNum preIndex,SNum postID,SNum postIndex);//断开突触
 };

@@ -32,7 +32,7 @@ struct _SYN_BUILD;
 typedef struct _SYN_BUILD SYN_BUILD;
 
 
-bool BuildSynapse(SNum nBuild,SYN_BUILD builds[],SNum *pNodeCount,SLNum **gSections,MultiGPUBrain::MemSchedule<SYNAPSE> **gSynapses,SNum *nMaxSynCount=NULL,SNum nMeshSize=1);
+bool BuildSynapse(SNum nBuild,SYN_BUILD builds[],SNum *pNodeCount,SLNum **gSections,MultiGPUBrain::MemSchedule<SYNAPSE> **gSynapses,SNum *nMaxSynCount=NULL,SLNum nGridSize=0,SNum nMeshSize=1);
 
 #define MYGRID_SIZE(a,b) ((a+b-1)/b)
 
@@ -67,6 +67,10 @@ public:
     void UseMyGPU();//使用本仿真器的GPU
     void Reset();//重置网络状态，以便从头开始仿真
 private:
+    bool PrepareSynapseSize();//仿真运行时存放突触所需要的显存
+    bool BuildInnerSynapse();//真正开始构建内部突触数据
+    bool BuildOutterSynapse();//真正开始构建外部突触数据
+    void CleanOutterBuilds();
     void CleanLIF();
     void CleanSynapse();
     void CleanOutputSynapse();
@@ -74,9 +78,13 @@ private:
     void UpdateNodeOffset();
     bool MapSynapses(SNum nPreNode);//将GPU中的突触映射到主存中
 private:
+    SNum mInnerBuildCount,mOutterBuildCount;//待构建的突触构建信息结构体数
+    SYN_BUILD *mInnerBuild,*mOutterBuild;//待构建的突触构建信息结构体
+    std::vector<std::pair<SNum,SYN_BUILD *>> mOutterBuilds;//待构建的外部突触信息结构体
     omp_lock_t mLock;
     SNum mBlockSize;//线程块大小
     bool mNodeChanged;
+    SNum mPopCount[TYPE_COUNT];//各类族群的数量
     SNum mNodeCounts[TYPE_COUNT];//各类节点的数量
     SNum mNodeOffsets[TYPE_COUNT+1];//各类节点的偏移量
     SFNum mTimestep;
@@ -99,6 +107,7 @@ private:
     std::vector<OUTPUT_SYNAPSES> mOutputSyn;//输出到其他分部的突触
     std::vector<MemSchedule<SYNAPSE> *> mOutputSynData;//输出到其他分部的完整突触数据
     SLNum mMaxGrid;//所有的突触数据中的最大块数
+    SLNum mInnerGridSize;//内部突触的块大小
     std::vector<PopMap> mInToOuts;//向外的族群映射，在向外输出脉冲时使用，与mOutputSyn一一对应
     std::vector<POP_MAPS> mOutsToIn;//向内的族群映射，后续需要将其传入到GPU再使用
 
@@ -108,6 +117,7 @@ private:
     SFNum *mgCurrent;//记录一个时间片组内各个时间片下各个神经元的输入电流
     SNum *mgActiveCount;//记录一个时间片组内各个时间片下活动神经元的个数
     SNum *mgActiveIndex;//记录一个时间片组内各个时间片下活动神经元的下标
+    SNum *mgActiveCountByGrid;//每个调度格子下的处于激活状态的神经元数
     POP_MAPS *mgOutsToIn;//向内的族群映射，与mOutsToIn大小相同，只是在GPU中
 public:
     SNum mGPUID;
